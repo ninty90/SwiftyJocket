@@ -412,6 +412,7 @@ class PollingTransport: TransportProtocol {
     }
     
     func close() {
+        sendPacket(["type": "close"])
         pollingTask?.cancel()
         pollingTask = nil
     }
