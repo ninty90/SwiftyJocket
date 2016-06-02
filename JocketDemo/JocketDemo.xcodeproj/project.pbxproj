@@ -93,8 +93,8 @@
 				E01ED23D1CEEDBD100A250BB /* AppDelegate.swift */,
 				E01ED23F1CEEDBD100A250BB /* ViewController.swift */,
 				E01ED2411CEEDBD100A250BB /* Main.storyboard */,
-				E01ED2441CEEDBD100A250BB /* Assets.xcassets */,
 				E01ED2461CEEDBD100A250BB /* LaunchScreen.storyboard */,
+				E01ED2441CEEDBD100A250BB /* Assets.xcassets */,
 				E01ED2491CEEDBD100A250BB /* Info.plist */,
 			);
 			path = JocketDemo;

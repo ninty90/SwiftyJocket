@@ -29,7 +29,7 @@ class ViewController: UIViewController {
         
         guard let content = textField.text else { return }
         
-        jocket?.sendPacket(["data": ["content": content]])
+        jocket?.sendPacket(["type":"message", "data": ["content": content]])
         
         let str = textView.text ?? ""
         textView.text = str + "Me: \(content)\n"
@@ -62,10 +62,9 @@ class ViewController: UIViewController {
     }
     
     private func openJocket() {
-        let url = NSURL(string: "http://192.168.2.115:8080/jocket/chat/simple")!
+        let url = NSURL(string: "http://127.0.0.1:8080")!
         
-        let jocket = Jocket(url: url)
-//        jocket.transports = [.Polling]
+        let jocket = Jocket(baseURL: url, appName: "jocket", path: "chat/simple")
         
         jocket.onOpen = {
             print("connection open")

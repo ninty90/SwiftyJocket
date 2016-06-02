@@ -12,25 +12,16 @@ public class Jocket {
     
     public typealias Packet = [String: AnyObject]
     
-    public struct TransportOptions: OptionSetType {
-        public var rawValue: Int = 0
-        
-        public init(rawValue: Int) {
-            self.rawValue = rawValue
-        }
-        
-        public static var WebSocket = TransportOptions(rawValue: 1 << 0)
-        public static var Polling = TransportOptions(rawValue: 1 << 1)
-    }
-    
     public enum CloseCode: Int {
-        case Normal        = 1000  // normal closure
-        case Away          = 1001  // close browser or reload page
-        case Abnomal       = 1006  // network error
-        case NeedInit      = 3600  // no jocket_sid passed to server
-        case NoSession     = 3601  // the Jocket session specified by jocket_sid is not found
-        case InitFailed    = 3602  // failed to open *.jocket_prepare
-        case ConnectFailed = 3603  // all available transports failed
+        case Normal          = 1000  // normal closure
+        case Away            = 1001  // close browser or reload page
+        case Abnomal         = 1006  // network error
+        case NoSessionParam  = 3600  // the Jocket session ID parameter is missing
+        case SessionNotFound = 3601  // the Jocket session is not found
+        case CreateFailed    = 3602  // failed to create Jocket session
+        case ConnectFailed   = 3603  // failed to connect to server
+        case PingTimeout     = 3604  // ping timeout
+        case PollingFailed   = 3605  // polling failed
     }
     
     public static let ErrorDomain = "tw.com.chainsea.jocket"
@@ -47,31 +38,34 @@ public class Jocket {
     public var onClose: ((NSError?) -> Void)?
     public var onPacket: ((Packet) -> Void)?
     
-    public var transports: TransportOptions = [.WebSocket, .Polling]
     public var autoReconnect: Bool = false
-    public var handshakeTimeout: NSTimeInterval = 3
     public var callbackQueue = dispatch_get_main_queue()
     
-    public var url: NSURL
+    public var baseURL: NSURL
+    public var appName: String
+    public var path: String
+    
     public var sessionId: String?
+    public var upgradable: Bool = false
+    public var pingInterval: NSTimeInterval = 25
+    public var pingTimeout: NSTimeInterval = 20
     
     private var transport: TransportProtocol?
-    private var isFirstConnection: Bool = true
-    private var transportArray = [String]()
-    private var transportTryIndex: Int = -1
     private var handshakeTimer: NSTimer?
+    private var heartbeatTimer: NSTimer?
     
     private static let transportQueue = dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0)
     
     deinit {
         clearHandshakeTimer()
-        
-        transport?.close()
-        transport = nil
+        clearHeartbeatTimer()
+        destoryCurrentTransport()
     }
     
-    public init(url: NSURL) {
-        self.url = url
+    public init(baseURL: NSURL, appName: String, path: String) {
+        self.baseURL = baseURL
+        self.appName = appName
+        self.path = path
     }
     
     public static func setLogger(logger: JLoggerProtocol) {
@@ -84,11 +78,11 @@ public class Jocket {
     }
     
     public func open() {
-        let prepare = prepareRequest()
+        let req = createRequest()
         
-        logging.debug("Open, prepareURL=\(prepare.URL!.absoluteString)")
+        logging.debug("Open, create url=\(req.URL!.absoluteString)")
         
-        HttpWorker.request(prepare, completionHandler: handlePrepareResponse)
+        HttpWorker.request(req, completionHandler: handleCreateResponse)
     }
     
     public func close() {
@@ -109,50 +103,45 @@ public class Jocket {
     }
     
     // MARK: Private methods
-    private func prepareRequest() -> NSURLRequest {
-        let url = NSURL(string: self.url.absoluteString + ".jocket_prepare")!
+    private func createRequest() -> NSURLRequest {
+        let str = "\(baseURL.absoluteString)/\(appName)/\(path).jocket"
+        
+        let url = NSURL(string: str)!
         let timeout: NSTimeInterval = 15
-        
-        var trans = [String]()
-        if transports.contains(.WebSocket) {
-            trans.append("websocket")
-        }
-        if transports.contains(.Polling) {
-            trans.append("polling")
-        }
-        
-        logging.debug("prepare trans=\(trans)")
         
         let request = NSMutableURLRequest(URL: url, cachePolicy: .ReloadIgnoringLocalCacheData, timeoutInterval: timeout)
         
-        request.HTTPMethod = "POST"
-        request.HTTPBody = dumpJSON(["transports": trans])
+        request.HTTPMethod = "GET"
         
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("no-store, no-cache", forHTTPHeaderField: "Cache-Control")
         
         return request
     }
     
-    private func handlePrepareResponse(result: Result<JSONObject, NSError>) {
+    private func handleCreateResponse(result: Result<JSONObject, NSError>) {
         switch result {
         case .Success(let json):
+            logging.debug("Create success, json=\(json)")
+            
             guard let
-                sid = json["sessionId"] as? String,
-                trans = json["transports"] as? [String] else {
+                sessionId = json["sessionId"] as? String,
+                upgradable = (json["upgradable"] as? NSNumber)?.boolValue,
+                pingInterval = (json["pingInterval"] as? NSNumber)?.doubleValue,
+                pingTimeout = (json["pingTimeout"] as? NSNumber)?.doubleValue else {
                     fatalError("Invalid server response")
             }
             
-            logging.debug("Prepare success, sessionId=\(sid), transports=\(trans)")
             
-            sessionId = sid
-            transportArray = trans
+            self.sessionId = sessionId
+            self.upgradable = upgradable
+            self.pingInterval = pingInterval / 1000
+            self.pingTimeout = pingTimeout / 1000
             
-            transportTryIndex = -1
-            tryNextTransport()
+            fireHandshakeTimer()
+            startPollingTransport()
             
         case .Failure(let error):
-            logging.debug("Prepare failure, error=\(error)")
+            logging.debug("Create failure, error=\(error)")
             
             dispatch_async(callbackQueue) {
                 self.onClose?(error)
@@ -160,68 +149,29 @@ public class Jocket {
         }
     }
     
-    private func tryNextTransport() {
-        transportTryIndex += 1
-        if transportTryIndex >= transportArray.count {
-            logging.debug("All tranports failure.")
-            
-            if isFirstConnection || !autoReconnect {
-                logging.debug("Failed to make Jocket connection.")
-                
-                dispatch_async(callbackQueue) {
-                    self.onClose?(Jocket.closeError(.ConnectFailed))
-                }
-                
-            } else if autoReconnect {
-                // TODO:
-            }
-            
-            isFirstConnection = false
-            return
-        }
+    private func startPollingTransport() {
+        let str = "\(baseURL.absoluteString)/\(appName)/jocket?s=\(sessionId!)"
         
-        let transportName = transportArray[transportTryIndex]
-        var transport = createTransport(transportName)
-        transport.onOpen = handleTransportOpen
-        transport.onClose = handleTransportClose
-        transport.onPacket = handleTransportPacket
-        self.transport = transport
+        transport = PollingTransport(url: NSURL(string: str)!)
+        transport?.onOpen = handleTransportOpen
+        transport?.onClose = handleTransportClose
+        transport?.onPacket = handleTransportPacket
         
-        logging.debug("Trying transport: sessionId=\(sessionId!), transport=\(transportName)")
+        logging.debug("Trying polling: sessionId=\(sessionId!)")
         
         self.transport?.open()
-        fireHandshakeTimer()
-    }
-    
-    private func createTransport(transportName: String) -> TransportProtocol {
-        let transport: TransportProtocol
-        
-        switch transportName {
-        case "websocket":
-            let str = (url.absoluteString as NSString).stringByReplacingOccurrencesOfString("http", withString: "ws") + "?jocket_sid=" + sessionId!
-            transport = WebSocketTransport(url: NSURL(string: str)!, queue: Jocket.transportQueue)
-        case "polling":
-            let str = url.absoluteString + ".jocket_polling?jocket_sid=" + sessionId!
-            transport = PollingTransport(url: NSURL(string: str)!)
-        default:
-            fatalError("Invalid transport response from server.")
-        }
-        
-        return transport
     }
     
     private func handleTransportOpen() {
-        sendPingPacket()
+        if handshakeTimer != nil {
+            sendPingPacket()
+        }
     }
     
     private func handleTransportClose(error: NSError?) {
         logging.debug("Transport close, error=\(error)")
         
-        if handshakeTimer != nil {
-            destoryCurrentTransport()
-            tryNextTransport()
-            return
-        }
+        destoryCurrentTransport()
         
         dispatch_async(callbackQueue) {
             self.onClose?(error)
@@ -250,14 +200,10 @@ public class Jocket {
         sendPacket(["type": "ping"])
     }
     
-    private func sendOpenPacket() {
-        sendPacket(["type": "open"])
-    }
-    
     private func handlePongPacket(packet: Packet) {
         if handshakeTimer != nil {
             clearHandshakeTimer()
-            sendOpenPacket()
+            fireHeartbeatTimer()
             
             dispatch_async(callbackQueue) {
                 self.onOpen?()
@@ -280,7 +226,7 @@ public class Jocket {
     }
     
     private func fireHandshakeTimer() {
-        handshakeTimer = NSTimer(timeInterval: handshakeTimeout, target: self, selector: #selector(handleHandshakeTimeout), userInfo: nil, repeats: false)
+        handshakeTimer = NSTimer(timeInterval: pingTimeout, target: self, selector: #selector(handleHandshakeTimeout), userInfo: nil, repeats: false)
         NSRunLoop.mainRunLoop().addTimer(handshakeTimer!, forMode: NSRunLoopCommonModes)
     }
     
@@ -292,7 +238,21 @@ public class Jocket {
     @objc
     private func handleHandshakeTimeout() {
         destoryCurrentTransport()
-        tryNextTransport()
+    }
+    
+    private func fireHeartbeatTimer() {
+        heartbeatTimer = NSTimer(timeInterval: pingInterval, target: self, selector: #selector(handleHeartbeatTimeout), userInfo: nil, repeats: true)
+        NSRunLoop.mainRunLoop().addTimer(heartbeatTimer!, forMode: NSRunLoopCommonModes)
+    }
+    
+    private func clearHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+    
+    @objc
+    private func handleHeartbeatTimeout() {
+        sendPingPacket()
     }
     
     
@@ -391,7 +351,7 @@ class PollingTransport: TransportProtocol {
     var onClose: ((NSError?) -> Void)?
     var onPacket: ((Packet) -> Void)?
     
-    var pollingTimeout: NSTimeInterval = 35
+    var pollingTimeout: NSTimeInterval = 3600
     var sendTimeout: NSTimeInterval = 15
     
     private var url: NSURL
@@ -505,6 +465,8 @@ class HttpWorker {
             }
             
             guard let resp = response as? NSHTTPURLResponse where resp.statusCode == 200 else {
+                debugPrint("http resp=\(response)")
+                
                 let err = workerError(.HttpError)
                 completionHandler(Result.Failure(err))
                 return
