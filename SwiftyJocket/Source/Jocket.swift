@@ -69,7 +69,7 @@ public class Jocket {
     }
     
     public static func setLogger(logger: JLoggerProtocol) {
-        logging = logger
+        JLog = logger
     }
     
     private static func closeError(code: CloseCode) -> NSError {
@@ -80,13 +80,13 @@ public class Jocket {
     public func open() {
         let req = createRequest()
         
-        logging.debug("Open, create url=\(req.URL!.absoluteString)")
+        JLog.debug("Open, create url=\(req.URL!.absoluteString)")
         
         HttpWorker.request(req, completionHandler: handleCreateResponse)
     }
     
     public func close() {
-        logging.debug("Close, sessionId=\(sessionId)")
+        JLog.debug("Close, sessionId=\(sessionId)")
         
         destoryCurrentTransport()
         sessionId = nil
@@ -97,7 +97,7 @@ public class Jocket {
     }
     
     public func sendPacket(packet: Packet) {
-        logging.debug("Packet send: \(packet)")
+        JLog.debug("Packet send: \(packet)")
         
         transport?.sendPacket(packet)
     }
@@ -118,10 +118,10 @@ public class Jocket {
         return request
     }
     
-    private func handleCreateResponse(result: Result<JSONObject, NSError>) {
+    private func handleCreateResponse(result: JResult<JObject, NSError>) {
         switch result {
         case .Success(let json):
-            logging.debug("Create success, json=\(json)")
+            JLog.debug("Create success, json=\(json)")
             
             guard let
                 sessionId = json["sessionId"] as? String,
@@ -141,7 +141,7 @@ public class Jocket {
             startPollingTransport()
             
         case .Failure(let error):
-            logging.debug("Create failure, error=\(error)")
+            JLog.debug("Create failure, error=\(error)")
             
             dispatch_async(callbackQueue) {
                 self.onClose?(error)
@@ -157,7 +157,7 @@ public class Jocket {
         transport?.onClose = handleTransportClose
         transport?.onPacket = handleTransportPacket
         
-        logging.debug("Trying polling: sessionId=\(sessionId!)")
+        JLog.debug("Trying polling: sessionId=\(sessionId!)")
         
         self.transport?.open()
     }
@@ -169,7 +169,7 @@ public class Jocket {
     }
     
     private func handleTransportClose(error: NSError?) {
-        logging.debug("Transport close, error=\(error)")
+        JLog.debug("Transport close, error=\(error)")
         
         destoryCurrentTransport()
         
@@ -179,7 +179,7 @@ public class Jocket {
     }
     
     private func handleTransportPacket(packet: Packet) {
-        logging.debug("Packet recv: \(packet)")
+        JLog.debug("Packet recv: \(packet)")
         
         guard let type = packet["type"] as? String else {
             handleNormalPacket(packet)
@@ -312,7 +312,7 @@ class WebSocketTransport: TransportProtocol {
         socket.onText = { [weak self] text in
             guard let
                 data = text.dataUsingEncoding(NSUTF8StringEncoding),
-                packet = parseJSON(data) else {
+                packet = parseJObject(data) else {
                     return
             }
             
@@ -330,7 +330,7 @@ class WebSocketTransport: TransportProtocol {
     
     func sendPacket(packet: Packet) {
         guard let
-            data = dumpJSON(packet),
+            data = dumpJObject(packet),
             str = String(data: data, encoding: NSUTF8StringEncoding) else {
                 return
         }
@@ -426,7 +426,7 @@ class PollingTransport: TransportProtocol {
         let request = NSMutableURLRequest(URL: url, cachePolicy: .ReloadIgnoringLocalCacheData, timeoutInterval: timeout)
         
         request.HTTPMethod = "POST"
-        request.HTTPBody = dumpJSON(packet)
+        request.HTTPBody = dumpJObject(packet)
         
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("no-store, no-cache", forHTTPHeaderField: "Cache-Control")
@@ -451,7 +451,7 @@ class HttpWorker {
         return session
     }()
     
-    static func request(request: NSURLRequest, completionHandler: Result<JSONObject, NSError> -> Void)
+    static func request(request: NSURLRequest, completionHandler: JResult<JObject, NSError> -> Void)
         -> NSURLSessionDataTask
     {
         let req = request.mutableCopy() as! NSMutableURLRequest
@@ -460,7 +460,7 @@ class HttpWorker {
         let task = session.dataTaskWithRequest(req) { (data, response, error) in
             
             if let e = error {
-                completionHandler(Result.Failure(e))
+                completionHandler(JResult.Failure(e))
                 return
             }
             
@@ -468,17 +468,17 @@ class HttpWorker {
                 debugPrint("http resp=\(response)")
                 
                 let err = workerError(.HttpError)
-                completionHandler(Result.Failure(err))
+                completionHandler(JResult.Failure(err))
                 return
             }
             
-            guard let d = data, json = parseJSON(d) else {
+            guard let d = data, json = parseJObject(d) else {
                 let err = workerError(.ParseJSONFailed)
-                completionHandler(Result.Failure(err))
+                completionHandler(JResult.Failure(err))
                 return
             }
 
-            completionHandler(Result.Success(json))
+            completionHandler(JResult.Success(json))
         }
         
         task.resume()
@@ -496,16 +496,16 @@ class HttpWorker {
 
 
 // MARK: JSON object
-typealias JSONObject = [String: AnyObject]
+typealias JObject = [String: AnyObject]
 
-func parseJSON(data: NSData) -> JSONObject? {
+func parseJObject(data: NSData) -> JObject? {
     guard let result = try? NSJSONSerialization.JSONObjectWithData(data, options: NSJSONReadingOptions()) else {
         return nil
     }
     
-    if let dictionary = result as? JSONObject {
+    if let dictionary = result as? JObject {
         return dictionary
-    } else if let array = result as? [JSONObject] {
+    } else if let array = result as? [JObject] {
         // a little tricky here ...
         return ["data": array]
     } else {
@@ -513,7 +513,7 @@ func parseJSON(data: NSData) -> JSONObject? {
     }
 }
 
-func dumpJSON(json: JSONObject) -> NSData? {
+func dumpJObject(json: JObject) -> NSData? {
     guard let data = try? NSJSONSerialization.dataWithJSONObject(json, options: NSJSONWritingOptions()) else {
         return nil
     }
@@ -522,8 +522,8 @@ func dumpJSON(json: JSONObject) -> NSData? {
 }
 
 
-// MARK: Result
-enum Result<Value, Error> {
+// MARK: JResult
+enum JResult<Value, Error> {
     case Success(Value)
     case Failure(Error)
     
@@ -560,7 +560,7 @@ enum Result<Value, Error> {
 }
 
 // MARK: Logging
-var logging: JLoggerProtocol = JLogger()
+var JLog: JLoggerProtocol = JLogger()
 
 public protocol JLoggerProtocol {
     var enable: Bool { get set }
